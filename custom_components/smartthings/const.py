@@ -1,6 +1,5 @@
 """Constants used by the SmartThings component and platforms."""
 from datetime import timedelta
-import re
 
 from homeassistant.const import (
     UnitOfElectricPotential,
@@ -11,6 +10,29 @@ from homeassistant.const import (
 
 DOMAIN = "smartthings"
 
+# OAuth2 scopes for SmartThings API
+SCOPES = [
+    "r:devices:*",
+    "w:devices:*",
+    "x:devices:*",
+    "r:hubs:*",
+    "r:locations:*",
+    "w:locations:*",
+    "x:locations:*",
+    "r:scenes:*",
+    "x:scenes:*",
+    "r:rules:*",
+    "w:rules:*",
+    "sse",
+]
+
+REQUESTED_SCOPES = [
+    *SCOPES,
+    "r:installedapps",
+    "w:installedapps",
+]
+
+# Legacy config keys (for migration compatibility)
 APP_OAUTH_CLIENT_NAME = "Home Assistant"
 APP_OAUTH_SCOPES = ["r:devices:*"]
 APP_NAME_PREFIX = "homeassistant."
@@ -21,6 +43,9 @@ CONF_INSTALLED_APP_ID = "installed_app_id"
 CONF_INSTANCE_ID = "instance_id"
 CONF_LOCATION_ID = "location_id"
 CONF_REFRESH_TOKEN = "refresh_token"
+
+# Used for migration from old data format
+OLD_DATA = "old_data"
 
 DATA_MANAGER = "manager"
 DATA_BROKERS = "brokers"
@@ -69,6 +94,3 @@ UNIT_MAP = {
 }
 
 TOKEN_REFRESH_INTERVAL = timedelta(days=14)
-
-VAL_UID = "^(?:([0-9a-fA-F]{32})|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}))$"
-VAL_UID_MATCHER = re.compile(VAL_UID)

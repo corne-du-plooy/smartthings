@@ -13,7 +13,7 @@ from pysmartthings import Attribute, Capability, SmartThings
 from pysmartthings.device import DeviceEntity
 
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import CONF_ACCESS_TOKEN, CONF_CLIENT_ID, CONF_CLIENT_SECRET
+from homeassistant.const import CONF_ACCESS_TOKEN, CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_TOKEN
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -96,39 +96,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         return False
 
-    api = SmartThings(async_get_clientsession(hass), entry.data[CONF_ACCESS_TOKEN])
+    # Get access token from OAuth2 token or legacy access token
+    if CONF_TOKEN in entry.data:
+        access_token = entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN]
+    else:
+        # Legacy entry with direct access token
+        access_token = entry.data[CONF_ACCESS_TOKEN]
+    
+    api = SmartThings(async_get_clientsession(hass), access_token)
 
     remove_entry = False
     try:
-        # See if the app is already setup. This occurs when there are
-        # installs in multiple SmartThings locations (valid use-case)
-        manager = hass.data[DOMAIN][DATA_MANAGER]
-        smart_app = manager.smartapps.get(entry.data[CONF_APP_ID])
-        if not smart_app:
-            # Validate and setup the app.
-            app = await api.app(entry.data[CONF_APP_ID])
-            smart_app = setup_smartapp(hass, app)
+        # Handle OAuth vs legacy setup
+        if CONF_TOKEN in entry.data:
+            # OAuth setup - simpler flow
+            scenes = await async_get_entry_scenes(entry, api)
+            devices = await api.devices(location_ids=[entry.data[CONF_LOCATION_ID]])
+            smart_app = None
+            token = None
+        else:
+            # Legacy setup with SmartApp
+            # See if the app is already setup. This occurs when there are
+            # installs in multiple SmartThings locations (valid use-case)
+            manager = hass.data[DOMAIN][DATA_MANAGER]
+            smart_app = manager.smartapps.get(entry.data[CONF_APP_ID])
+            if not smart_app:
+                # Validate and setup the app.
+                app = await api.app(entry.data[CONF_APP_ID])
+                smart_app = setup_smartapp(hass, app)
 
-        # Validate and retrieve the installed app.
-        installed_app = await validate_installed_app(
-            api, entry.data[CONF_INSTALLED_APP_ID]
-        )
+            # Validate and retrieve the installed app.
+            installed_app = await validate_installed_app(
+                api, entry.data[CONF_INSTALLED_APP_ID]
+            )
 
-        # Get scenes
-        scenes = await async_get_entry_scenes(entry, api)
+            # Get scenes
+            scenes = await async_get_entry_scenes(entry, api)
 
-        # Get SmartApp token to sync subscriptions
-        token = await api.generate_tokens(
-            entry.data[CONF_CLIENT_ID],
-            entry.data[CONF_CLIENT_SECRET],
-            entry.data[CONF_REFRESH_TOKEN],
-        )
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_REFRESH_TOKEN: token.refresh_token}
-        )
+            # Get SmartApp token to sync subscriptions
+            token = await api.generate_tokens(
+                entry.data[CONF_CLIENT_ID],
+                entry.data[CONF_CLIENT_SECRET],
+                entry.data[CONF_REFRESH_TOKEN],
+            )
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_REFRESH_TOKEN: token.refresh_token}
+            )
 
-        # Get devices and their current status
-        devices = await api.devices(location_ids=[installed_app.location_id])
+            # Get devices and their current status
+            devices = await api.devices(location_ids=[installed_app.location_id])
 
         async def retrieve_device_status(device):
             try:
@@ -144,14 +160,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         await asyncio.gather(*(retrieve_device_status(d) for d in devices.copy()))
 
-        # Sync device subscriptions
-        await smartapp_sync_subscriptions(
-            hass,
-            token.access_token,
-            installed_app.location_id,
-            installed_app.installed_app_id,
-            devices,
-        )
+        # Sync device subscriptions (only for legacy setup)
+        if CONF_TOKEN not in entry.data:
+            await smartapp_sync_subscriptions(
+                hass,
+                token.access_token,
+                installed_app.location_id,
+                installed_app.installed_app_id,
+                devices,
+            )
 
         # Setup device broker
         broker = DeviceBroker(hass, entry, token, smart_app, devices, scenes)
@@ -215,9 +232,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Perform clean-up when entry is being removed."""
-    api = SmartThings(async_get_clientsession(hass), entry.data[CONF_ACCESS_TOKEN])
+    # Get access token from OAuth2 token or legacy access token
+    if CONF_TOKEN in entry.data:
+        access_token = entry.data[CONF_TOKEN][CONF_ACCESS_TOKEN]
+    else:
+        # Legacy entry with direct access token
+        access_token = entry.data[CONF_ACCESS_TOKEN]
+    
+    api = SmartThings(async_get_clientsession(hass), access_token)
 
-    # Remove the installed_app, which if already removed raises a HTTPStatus.FORBIDDEN error.
+    # For OAuth entries, no app cleanup is needed
+    if CONF_TOKEN in entry.data:
+        _LOGGER.debug("OAuth entry removed, no app cleanup needed")
+        return
+
+    # Legacy entry cleanup - Remove the installed_app
     installed_app_id = entry.data[CONF_INSTALLED_APP_ID]
     try:
         await api.delete_installed_app(installed_app_id)
@@ -307,32 +336,35 @@ class DeviceBroker:
 
     def connect(self):
         """Connect handlers/listeners for device/lifecycle events."""
-        # Setup interval to regenerate the refresh token on a periodic basis.
-        # Tokens expire in 30 days and once expired, cannot be recovered.
-        async def regenerate_refresh_token(now):
-            """Generate a new refresh token and update the config entry."""
-            await self._token.refresh(
-                self._entry.data[CONF_CLIENT_ID],
-                self._entry.data[CONF_CLIENT_SECRET],
-            )
-            self._hass.config_entries.async_update_entry(
-                self._entry,
-                data={
-                    **self._entry.data,
-                    CONF_REFRESH_TOKEN: self._token.refresh_token,
-                },
-            )
-            _LOGGER.debug(
-                "Regenerated refresh token for installed app: %s",
-                self._installed_app_id,
+        # Only setup token refresh for legacy entries
+        if self._token and CONF_TOKEN not in self._entry.data:
+            # Setup interval to regenerate the refresh token on a periodic basis.
+            # Tokens expire in 30 days and once expired, cannot be recovered.
+            async def regenerate_refresh_token(now):
+                """Generate a new refresh token and update the config entry."""
+                await self._token.refresh(
+                    self._entry.data[CONF_CLIENT_ID],
+                    self._entry.data[CONF_CLIENT_SECRET],
+                )
+                self._hass.config_entries.async_update_entry(
+                    self._entry,
+                    data={
+                        **self._entry.data,
+                        CONF_REFRESH_TOKEN: self._token.refresh_token,
+                    },
+                )
+                _LOGGER.debug(
+                    "Regenerated refresh token for installed app: %s",
+                    self._installed_app_id,
+                )
+
+            self._regenerate_token_remove = async_track_time_interval(
+                self._hass, regenerate_refresh_token, TOKEN_REFRESH_INTERVAL
             )
 
-        self._regenerate_token_remove = async_track_time_interval(
-            self._hass, regenerate_refresh_token, TOKEN_REFRESH_INTERVAL
-        )
-
-        # Connect handler to incoming device events
-        self._event_disconnect = self._smart_app.connect_event(self._event_handler)
+        # Connect handler to incoming device events (only for legacy SmartApp)
+        if self._smart_app:
+            self._event_disconnect = self._smart_app.connect_event(self._event_handler)
 
     def disconnect(self):
         """Disconnects handlers/listeners for device/lifecycle events."""
