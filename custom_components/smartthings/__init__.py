@@ -25,7 +25,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
-from .config_flow import SmartThingsFlowHandler  # noqa: F401
+from .config_flow import SmartThingsConfigFlow  # noqa: F401
 from .const import (
     CONF_APP_ID,
     CONF_INSTALLED_APP_ID,
@@ -54,7 +54,10 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Initialize the SmartThings platform."""
-    await setup_smartapp_endpoint(hass)
+    # Initialize the domain data
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN].setdefault(DATA_MANAGER, None)
+    hass.data[DOMAIN].setdefault(DATA_BROKERS, {})
     return True
 
 
@@ -81,8 +84,8 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Initialize config entry which represents an installed SmartApp."""
-    # For backwards compat
-    if entry.unique_id is None:
+    # For backwards compat - only for legacy entries
+    if entry.unique_id is None and CONF_APP_ID in entry.data:
         hass.config_entries.async_update_entry(
             entry,
             unique_id=format_unique_id(
@@ -90,11 +93,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ),
         )
 
-    if not validate_webhook_requirements(hass):
-        _LOGGER.warning(
-            "The 'base_url' of the 'http' integration must be configured and start with 'https://'"
-        )
-        return False
+    # Webhook validation only needed for legacy SmartApp entries
+    if CONF_TOKEN not in entry.data:
+        if not validate_webhook_requirements(hass):
+            _LOGGER.warning(
+                "The 'base_url' of the 'http' integration must be configured and start with 'https://'"
+            )
+            return False
 
     # Get access token from OAuth2 token or legacy access token
     if CONF_TOKEN in entry.data:
@@ -301,7 +306,7 @@ class DeviceBroker:
         """Create a new instance of the DeviceBroker."""
         self._hass = hass
         self._entry = entry
-        self._installed_app_id = entry.data[CONF_INSTALLED_APP_ID]
+        self._installed_app_id = entry.data.get(CONF_INSTALLED_APP_ID)
         self._smart_app = smart_app
         self._token = token
         self._event_disconnect = None
@@ -355,7 +360,7 @@ class DeviceBroker:
                 )
                 _LOGGER.debug(
                     "Regenerated refresh token for installed app: %s",
-                    self._installed_app_id,
+                    self._installed_app_id or "OAuth entry",
                 )
 
             self._regenerate_token_remove = async_track_time_interval(
@@ -387,7 +392,8 @@ class DeviceBroker:
         """Broker for incoming events."""
         # Do not process events received from a different installed app
         # under the same parent SmartApp (valid use-scenario)
-        if req.installed_app_id != self._installed_app_id:
+        # Skip this check for OAuth entries (no installed app id)
+        if self._installed_app_id and req.installed_app_id != self._installed_app_id:
             return
 
         updated_devices = set()
