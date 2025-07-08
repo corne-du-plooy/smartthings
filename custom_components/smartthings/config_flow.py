@@ -45,7 +45,7 @@ class SmartThingsConfigFlow(AbstractOAuth2FlowHandler, domain=DOMAIN):
             return self.async_abort(reason="missing_scopes")
         
         client = SmartThings(async_get_clientsession(self.hass), data[CONF_TOKEN][CONF_ACCESS_TOKEN])
-        locations = await client.get_locations()
+        locations = await client.locations()
         location = locations[0]
         
         # We pick to use the location id as unique id rather than the installed app id
